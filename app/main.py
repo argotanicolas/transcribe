@@ -1,4 +1,4 @@
-import os
+import logging
 import uuid
 import threading
 from pathlib import Path
@@ -10,6 +10,8 @@ import aiofiles
 from .config import settings
 from .transcriber import transcribe, ALL_EXTENSIONS
 from .database import init_db, create_job, set_processing, set_done, set_error, get_job
+
+logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Transcribe API", version="2.0.0")
 
@@ -24,6 +26,7 @@ UPLOAD_DIR = Path(settings.temp_dir)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 init_db()
+logger.info(f"=== Transcribe API v2 lista — modelo={settings.model_size} device={settings.device} temp={settings.temp_dir} ===")
 
 
 def require_api_key(authorization: str = Header(...)):
@@ -36,9 +39,13 @@ def require_api_key(authorization: str = Header(...)):
 
 def _run_transcription(job_id: str, file_path: str, filename_stem: str, language: str | None):
     path = Path(file_path)
+    size_mb = path.stat().st_size / 1024 / 1024 if path.exists() else 0
+    logger.info(f"[{job_id}] ▶ Iniciando transcripción — archivo={filename_stem!r} size={size_mb:.1f}MB language={language or 'auto'}")
     try:
         set_processing(job_id)
+        logger.info(f"[{job_id}] ⚙ Cargando modelo Whisper y procesando audio...")
         result = transcribe(file_path, language)
+        logger.info(f"[{job_id}] ✔ Whisper terminó — idioma={result['language']} duración={result['duration']:.1f}s palabras≈{len(result['text'].split())}")
 
         txt_path = UPLOAD_DIR / f"{job_id}.txt"
         srt_path = UPLOAD_DIR / f"{job_id}.srt"
@@ -46,11 +53,14 @@ def _run_transcription(job_id: str, file_path: str, filename_stem: str, language
         srt_path.write_text(result["srt_content"], encoding="utf-8")
 
         set_done(job_id, result["language"], result["duration"], result["text"], result["srt_content"])
+        logger.info(f"[{job_id}] ✅ Job completado y guardado en SQLite")
     except Exception as e:
+        logger.error(f"[{job_id}] ❌ Error en transcripción: {e}", exc_info=True)
         set_error(job_id, str(e))
     finally:
         if path.exists():
             path.unlink()
+            logger.info(f"[{job_id}] 🗑 Archivo temporal eliminado")
 
 
 @app.get("/health")
@@ -66,6 +76,7 @@ async def transcribe_file(
 ):
     ext = Path(file.filename or "").suffix.lower()
     if ext not in ALL_EXTENSIONS:
+        logger.warning(f"Formato rechazado: {ext} — archivo={file.filename!r}")
         raise HTTPException(status_code=400, detail=f"Unsupported format: {ext}. Allowed: {', '.join(ALL_EXTENSIONS)}")
 
     max_bytes = settings.max_file_size_mb * 1024 * 1024
@@ -73,18 +84,24 @@ async def transcribe_file(
     file_path = UPLOAD_DIR / f"{job_id}{ext}"
     filename_stem = Path(file.filename or "audio").stem
 
+    logger.info(f"[{job_id}] 📥 Recibido archivo={file.filename!r} ext={ext}")
+
     try:
         async with aiofiles.open(file_path, "wb") as out:
             total = 0
             while chunk := await file.read(1024 * 1024):
                 total += len(chunk)
                 if total > max_bytes:
+                    logger.warning(f"[{job_id}] Archivo demasiado grande: {total / 1024 / 1024:.1f}MB > {settings.max_file_size_mb}MB")
                     raise HTTPException(status_code=413, detail=f"File exceeds {settings.max_file_size_mb}MB limit")
                 await out.write(chunk)
     except HTTPException:
         if file_path.exists():
             file_path.unlink()
         raise
+
+    size_mb = file_path.stat().st_size / 1024 / 1024
+    logger.info(f"[{job_id}] 💾 Guardado en disco: {size_mb:.1f}MB — lanzando thread...")
 
     create_job(job_id, file.filename or "audio")
 
@@ -95,6 +112,7 @@ async def transcribe_file(
     )
     thread.start()
 
+    logger.info(f"[{job_id}] 🚀 Thread iniciado — respondiendo 202 al cliente")
     return JSONResponse({"job_id": job_id, "status": "pending"}, status_code=202)
 
 
@@ -102,7 +120,9 @@ async def transcribe_file(
 def get_status(job_id: str, _: None = Depends(require_api_key)):
     job = get_job(job_id)
     if not job:
+        logger.warning(f"[{job_id}] GET /status — job no encontrado")
         raise HTTPException(status_code=404, detail="Job not found")
+    logger.info(f"[{job_id}] GET /status → {job['status']}")
 
     response: dict = {
         "job_id": job_id,
