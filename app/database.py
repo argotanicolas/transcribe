@@ -56,3 +56,13 @@ def get_job(job_id: str) -> dict | None:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return dict(row) if row else None
+
+def list_jobs() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC").fetchall()
+        return [dict(r) for r in rows]
+
+def delete_job(job_id: str):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+        conn.commit()

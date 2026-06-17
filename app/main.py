@@ -1,6 +1,7 @@
 import logging
 import uuid
 import threading
+import time
 from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Header
 from fastapi.responses import FileResponse, JSONResponse
@@ -8,8 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import aiofiles
 
 from .config import settings
-from .transcriber import transcribe, ALL_EXTENSIONS
-from .database import init_db, create_job, set_processing, set_done, set_error, get_job
+from .transcriber import transcribe, ALL_EXTENSIONS, get_model_size, set_model_size
+from .database import init_db, create_job, set_processing, set_done, set_error, get_job, list_jobs, delete_job
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -165,3 +166,58 @@ def download_srt(job_id: str, _: None = Depends(require_api_key)):
         raise HTTPException(status_code=404, detail="File not found")
     stem = Path(job["filename"]).stem
     return FileResponse(str(srt_path), media_type="text/plain", filename=f"{stem}.srt")
+
+
+# ── Admin: job management ─────────────────────────────────────────────────────
+
+@app.get("/jobs")
+def list_all_jobs(_: None = Depends(require_api_key)):
+    jobs = list_jobs()
+    logger.info(f"GET /jobs → {len(jobs)} jobs")
+    return JSONResponse(jobs)
+
+@app.delete("/jobs/{job_id}")
+def delete_job_endpoint(job_id: str, _: None = Depends(require_api_key)):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    # clean up files
+    for ext in ["txt", "srt"]:
+        p = UPLOAD_DIR / f"{job_id}.{ext}"
+        if p.exists():
+            p.unlink()
+    delete_job(job_id)
+    logger.info(f"[{job_id}] 🗑 Job eliminado por admin")
+    return JSONResponse({"ok": True})
+
+@app.post("/jobs/{job_id}/retry")
+def retry_job(job_id: str, _: None = Depends(require_api_key)):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] != "error":
+        raise HTTPException(status_code=400, detail="Only error jobs can be retried")
+    # the original file was deleted — we can't retry without the file
+    raise HTTPException(status_code=400, detail="El archivo original fue eliminado. Subí el archivo de nuevo.")
+
+# ── Admin: config ─────────────────────────────────────────────────────────────
+
+@app.get("/config")
+def get_config(_: None = Depends(require_api_key)):
+    return JSONResponse({
+        "model_size": get_model_size(),
+        "compute_type": settings.compute_type,
+        "device": settings.device,
+        "available_models": ["tiny", "base", "small", "medium", "large-v2", "large-v3"],
+    })
+
+@app.patch("/config")
+def update_config(body: dict, _: None = Depends(require_api_key)):
+    new_size = body.get("model_size")
+    allowed = {"tiny", "base", "small", "medium", "large-v2", "large-v3"}
+    if not new_size or new_size not in allowed:
+        raise HTTPException(status_code=400, detail=f"model_size debe ser uno de: {', '.join(sorted(allowed))}")
+    old = get_model_size()
+    set_model_size(new_size)
+    logger.info(f"⚙ Modelo cambiado: {old} → {new_size} (se recargará en próxima transcripción)")
+    return JSONResponse({"ok": True, "model_size": new_size})

@@ -6,11 +6,12 @@ from faster_whisper import WhisperModel
 from .config import settings
 
 _model: WhisperModel | None = None
+_current_model_size: str | None = None
 
 def get_model() -> WhisperModel:
     global _model
     if _model is None:
-        _model = WhisperModel(settings.model_size, device=settings.device, compute_type=settings.compute_type)
+        _model = WhisperModel(_current_model_size or settings.model_size, device=settings.device, compute_type=settings.compute_type)
     return _model
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi"}
@@ -73,3 +74,11 @@ def transcribe(file_path: str, language: str | None = None) -> dict:
     finally:
         if tmp_audio and os.path.exists(tmp_audio):
             os.remove(tmp_audio)
+
+def get_model_size() -> str:
+    return _current_model_size if _current_model_size else settings.model_size
+
+def set_model_size(new_size: str):
+    global _model, _current_model_size
+    _current_model_size = new_size
+    _model = None  # forces reload on next transcription
