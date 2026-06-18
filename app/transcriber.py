@@ -11,7 +11,14 @@ _current_model_size: str | None = None
 def get_model() -> WhisperModel:
     global _model
     if _model is None:
-        _model = WhisperModel(_current_model_size or settings.model_size, device=settings.device, compute_type=settings.compute_type)
+        size = _current_model_size or settings.model_size
+        _model = WhisperModel(
+            size,
+            device=settings.device,
+            compute_type=settings.compute_type,
+            cpu_threads=settings.cpu_threads,
+            num_workers=settings.num_workers,
+        )
     return _model
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi"}
@@ -44,36 +51,41 @@ def segments_to_srt(segments: list[dict]) -> str:
         lines.append(f"{i}\n{start} --> {end}\n{seg['text'].strip()}\n")
     return "\n".join(lines)
 
-def transcribe(file_path: str, language: str | None = None) -> dict:
+def transcribe_stream(file_path: str, language: str | None = None):
+    """
+    Returns (info, segment_generator).
+    The generator yields {"start", "end", "text"} dicts as Whisper processes each segment.
+    Cleans up tmp audio in its finally block (triggered on break/close/exhaustion).
+    """
     ext = Path(file_path).suffix.lower()
+    tmp_audio = None
     audio_path = file_path
 
-    tmp_audio = None
     if ext in VIDEO_EXTENSIONS:
         tmp_audio = f"/tmp/transcribe/{uuid.uuid4()}.wav"
         os.makedirs("/tmp/transcribe", exist_ok=True)
         extract_audio(file_path, tmp_audio)
         audio_path = tmp_audio
 
-    try:
-        model = get_model()
-        kwargs = {"beam_size": 5}
-        if language:
-            kwargs["language"] = language
+    # Resolve effective language: None/"auto" → auto-detect; anything else → forzar idioma
+    effective_language = language if (language and language != "auto") else settings.default_language
 
-        raw_segments, info = model.transcribe(audio_path, **kwargs)
-        segments = [{"start": s.start, "end": s.end, "text": s.text} for s in raw_segments]
+    model = get_model()
+    kwargs = {"beam_size": 5, "condition_on_previous_text": False}
+    if effective_language != "auto":
+        kwargs["language"] = effective_language
 
-        return {
-            "language": info.language,
-            "duration": round(info.duration, 2),
-            "text": " ".join(s["text"].strip() for s in segments),
-            "srt_content": segments_to_srt(segments),
-            "segments": segments,
-        }
-    finally:
-        if tmp_audio and os.path.exists(tmp_audio):
-            os.remove(tmp_audio)
+    raw_segments, info = model.transcribe(audio_path, **kwargs)
+
+    def _gen():
+        try:
+            for s in raw_segments:
+                yield {"start": s.start, "end": s.end, "text": s.text}
+        finally:
+            if tmp_audio and os.path.exists(tmp_audio):
+                os.remove(tmp_audio)
+
+    return info, _gen()
 
 def get_model_size() -> str:
     return _current_model_size if _current_model_size else settings.model_size
@@ -81,4 +93,4 @@ def get_model_size() -> str:
 def set_model_size(new_size: str):
     global _model, _current_model_size
     _current_model_size = new_size
-    _model = None  # forces reload on next transcription
+    _model = None

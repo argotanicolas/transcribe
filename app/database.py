@@ -20,10 +20,24 @@ def init_db():
                 duration     REAL,
                 text_content TEXT,
                 srt_content  TEXT,
+                partial_text TEXT,
                 error        TEXT,
                 created_at   TEXT DEFAULT (datetime('now'))
             )
         """)
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN partial_text TEXT")
+        except Exception:
+            pass
+        conn.commit()
+
+def reset_stuck_jobs():
+    """On startup: jobs stuck in processing/pending have no live thread — mark as error."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE jobs SET status='error', error='Servicio reiniciado durante la transcripción' "
+            "WHERE status IN ('processing', 'pending')"
+        )
         conn.commit()
 
 def create_job(job_id: str, filename: str):
@@ -39,17 +53,22 @@ def set_processing(job_id: str):
         conn.execute("UPDATE jobs SET status='processing' WHERE id=?", (job_id,))
         conn.commit()
 
+def update_partial(job_id: str, partial_text: str):
+    with get_conn() as conn:
+        conn.execute("UPDATE jobs SET partial_text=? WHERE id=?", (partial_text, job_id))
+        conn.commit()
+
 def set_done(job_id: str, language: str, duration: float, text: str, srt: str):
     with get_conn() as conn:
         conn.execute(
-            "UPDATE jobs SET status='done', language=?, duration=?, text_content=?, srt_content=? WHERE id=?",
+            "UPDATE jobs SET status='done', language=?, duration=?, text_content=?, srt_content=?, partial_text=NULL WHERE id=?",
             (language, duration, text, srt, job_id)
         )
         conn.commit()
 
 def set_error(job_id: str, error: str):
     with get_conn() as conn:
-        conn.execute("UPDATE jobs SET status='error', error=? WHERE id=?", (error, job_id))
+        conn.execute("UPDATE jobs SET status='error', error=?, partial_text=NULL WHERE id=?", (error, job_id))
         conn.commit()
 
 def get_job(job_id: str) -> dict | None:

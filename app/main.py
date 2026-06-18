@@ -9,8 +9,12 @@ from fastapi.middleware.cors import CORSMiddleware
 import aiofiles
 
 from .config import settings
-from .transcriber import transcribe, ALL_EXTENSIONS, get_model_size, set_model_size
-from .database import init_db, create_job, set_processing, set_done, set_error, get_job, list_jobs, delete_job
+from .transcriber import transcribe_stream, segments_to_srt, ALL_EXTENSIONS, get_model_size, set_model_size
+from .database import (
+    init_db, reset_stuck_jobs, create_job,
+    set_processing, update_partial, set_done, set_error,
+    get_job, list_jobs, delete_job,
+)
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -27,7 +31,15 @@ UPLOAD_DIR = Path(settings.temp_dir)
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 init_db()
-logger.info(f"=== Transcribe API v2 lista — modelo={settings.model_size} device={settings.device} temp={settings.temp_dir} ===")
+reset_stuck_jobs()
+logger.info(
+    f"=== Transcribe API v2 lista — modelo={settings.model_size} device={settings.device} "
+    f"compute={settings.compute_type} threads={settings.cpu_threads} workers={settings.num_workers} "
+    f"lang_default={settings.default_language} temp={settings.temp_dir} ==="
+)
+
+# cancel flags: job_id → threading.Event
+_cancel_flags: dict[str, threading.Event] = {}
 
 
 def require_api_key(authorization: str = Header(...)):
@@ -38,27 +50,48 @@ def require_api_key(authorization: str = Header(...)):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-def _run_transcription(job_id: str, file_path: str, filename_stem: str, language: str | None):
+def _run_transcription(job_id: str, file_path: str, filename_stem: str, language: str | None, cancel_event: threading.Event):
     path = Path(file_path)
     size_mb = path.stat().st_size / 1024 / 1024 if path.exists() else 0
-    logger.info(f"[{job_id}] ▶ Iniciando transcripción — archivo={filename_stem!r} size={size_mb:.1f}MB language={language or 'auto'}")
+    logger.info(f"[{job_id}] ▶ Iniciando transcripción — archivo={filename_stem!r} size={size_mb:.1f}MB language={language or f'default({settings.default_language})'}")
     try:
         set_processing(job_id)
-        logger.info(f"[{job_id}] ⚙ Cargando modelo Whisper y procesando audio...")
-        result = transcribe(file_path, language)
-        logger.info(f"[{job_id}] ✔ Whisper terminó — idioma={result['language']} duración={result['duration']:.1f}s palabras≈{len(result['text'].split())}")
+        logger.info(f"[{job_id}] ⚙ Cargando modelo Whisper ({settings.model_size})...")
+
+        info, segment_iter = transcribe_stream(file_path, language)
+        logger.info(f"[{job_id}] 🎙 Modelo listo — idioma detectado={info.language} duración={info.duration:.1f}s — transcribiendo...")
+
+        segments: list[dict] = []
+
+        for seg in segment_iter:
+            if cancel_event.is_set():
+                logger.info(f"[{job_id}] 🛑 Cancelación — deteniendo en segmento {len(segments) + 1}")
+                break
+            segments.append(seg)
+            partial = " ".join(s["text"].strip() for s in segments)
+            update_partial(job_id, partial)
+            logger.info(f"[{job_id}] 📝 [{seg['start']:.1f}s→{seg['end']:.1f}s] {seg['text'].strip()[:80]!r}")
+
+        final_text = " ".join(s["text"].strip() for s in segments)
+        srt_content = segments_to_srt(segments)
+
+        if cancel_event.is_set():
+            logger.info(f"[{job_id}] ✂️ Parcial guardado — {len(segments)} segmentos, palabras≈{len(final_text.split())}")
+        else:
+            logger.info(f"[{job_id}] ✔ Completo — {len(segments)} segmentos, palabras≈{len(final_text.split())}")
 
         txt_path = UPLOAD_DIR / f"{job_id}.txt"
         srt_path = UPLOAD_DIR / f"{job_id}.srt"
-        txt_path.write_text(result["text"], encoding="utf-8")
-        srt_path.write_text(result["srt_content"], encoding="utf-8")
+        txt_path.write_text(final_text, encoding="utf-8")
+        srt_path.write_text(srt_content, encoding="utf-8")
 
-        set_done(job_id, result["language"], result["duration"], result["text"], result["srt_content"])
-        logger.info(f"[{job_id}] ✅ Job completado y guardado en SQLite")
+        set_done(job_id, info.language, info.duration, final_text, srt_content)
+        logger.info(f"[{job_id}] ✅ Job guardado en SQLite")
     except Exception as e:
         logger.error(f"[{job_id}] ❌ Error en transcripción: {e}", exc_info=True)
         set_error(job_id, str(e))
     finally:
+        _cancel_flags.pop(job_id, None)
         if path.exists():
             path.unlink()
             logger.info(f"[{job_id}] 🗑 Archivo temporal eliminado")
@@ -106,9 +139,12 @@ async def transcribe_file(
 
     create_job(job_id, file.filename or "audio")
 
+    cancel_event = threading.Event()
+    _cancel_flags[job_id] = cancel_event
+
     thread = threading.Thread(
         target=_run_transcription,
-        args=(job_id, str(file_path), filename_stem, language),
+        args=(job_id, str(file_path), filename_stem, language, cancel_event),
         daemon=True,
     )
     thread.start()
@@ -138,6 +174,9 @@ def get_status(job_id: str, _: None = Depends(require_api_key)):
             "text": job["text_content"],
             "srt_content": job["srt_content"],
         })
+    elif job["status"] == "processing":
+        if job.get("partial_text"):
+            response["partial_text"] = job["partial_text"]
     elif job["status"] == "error":
         response["error"] = job["error"]
 
@@ -181,7 +220,6 @@ def delete_job_endpoint(job_id: str, _: None = Depends(require_api_key)):
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    # clean up files
     for ext in ["txt", "srt"]:
         p = UPLOAD_DIR / f"{job_id}.{ext}"
         if p.exists():
@@ -190,6 +228,22 @@ def delete_job_endpoint(job_id: str, _: None = Depends(require_api_key)):
     logger.info(f"[{job_id}] 🗑 Job eliminado por admin")
     return JSONResponse({"ok": True})
 
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str, _: None = Depends(require_api_key)):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] not in ("pending", "processing"):
+        raise HTTPException(status_code=400, detail=f"No se puede cancelar un job en estado '{job['status']}'")
+
+    if job_id in _cancel_flags:
+        _cancel_flags[job_id].set()
+        logger.info(f"[{job_id}] 🛑 Cancelación solicitada via API")
+        return JSONResponse({"ok": True, "message": "Cancelando — el resultado parcial se guardará al terminar el segmento actual"})
+    else:
+        set_error(job_id, "Cancelado por el usuario")
+        return JSONResponse({"ok": True, "message": "Job cancelado"})
+
 @app.post("/jobs/{job_id}/retry")
 def retry_job(job_id: str, _: None = Depends(require_api_key)):
     job = get_job(job_id)
@@ -197,7 +251,6 @@ def retry_job(job_id: str, _: None = Depends(require_api_key)):
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] != "error":
         raise HTTPException(status_code=400, detail="Only error jobs can be retried")
-    # the original file was deleted — we can't retry without the file
     raise HTTPException(status_code=400, detail="El archivo original fue eliminado. Subí el archivo de nuevo.")
 
 # ── Admin: config ─────────────────────────────────────────────────────────────
