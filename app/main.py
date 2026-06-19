@@ -261,13 +261,13 @@ def get_config(_: None = Depends(require_api_key)):
         "model_size": get_model_size(),
         "compute_type": settings.compute_type,
         "device": settings.device,
-        "available_models": ["tiny", "base", "small", "medium", "large-v2", "large-v3"],
+        "available_models": ["tiny", "base", "small", "medium", "large-v2", "large-v3", "distil-large-v3"],
     })
 
 @app.patch("/config")
 def update_config(body: dict, _: None = Depends(require_api_key)):
     new_size = body.get("model_size")
-    allowed = {"tiny", "base", "small", "medium", "large-v2", "large-v3"}
+    allowed = {"tiny", "base", "small", "medium", "large-v2", "large-v3", "distil-large-v3"}
     if not new_size or new_size not in allowed:
         raise HTTPException(status_code=400, detail=f"model_size debe ser uno de: {', '.join(sorted(allowed))}")
     old = get_model_size()

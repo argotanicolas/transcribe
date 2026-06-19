@@ -21,7 +21,7 @@ def get_model() -> WhisperModel:
         )
     return _model
 
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm"}
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a"}
 ALL_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 
@@ -71,7 +71,13 @@ def transcribe_stream(file_path: str, language: str | None = None):
     effective_language = language if (language and language != "auto") else settings.default_language
 
     model = get_model()
-    kwargs = {"beam_size": 5, "condition_on_previous_text": False}
+    kwargs = {
+        "beam_size": 1,                # greedy — 3-4x más rápido que beam_size=5
+        "condition_on_previous_text": False,
+        "temperature": 0,              # sin fallback de temperatura
+        "vad_filter": True,            # saltear silencio
+        "vad_parameters": {"min_silence_duration_ms": 500},
+    }
     if effective_language != "auto":
         kwargs["language"] = effective_language
 
