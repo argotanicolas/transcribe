@@ -41,6 +41,31 @@ logger.info(
 # cancel flags: job_id → threading.Event
 _cancel_flags: dict[str, threading.Event] = {}
 
+# Cola de transcripción: solo 1 job corre a la vez, el resto espera
+_transcription_semaphore = threading.Semaphore(1)
+_queue_lock = threading.Lock()
+_queue: list[str] = []  # job_ids esperando en cola, en orden de llegada
+
+
+def _enqueue(job_id: str):
+    with _queue_lock:
+        _queue.append(job_id)
+
+def _dequeue(job_id: str):
+    with _queue_lock:
+        try:
+            _queue.remove(job_id)
+        except ValueError:
+            pass
+
+def get_queue_position(job_id: str) -> int:
+    """Retorna posición en cola (0 = corriendo ahora, 1 = próximo, etc.)"""
+    with _queue_lock:
+        try:
+            return _queue.index(job_id)
+        except ValueError:
+            return -1
+
 
 def require_api_key(authorization: str = Header(...)):
     if not authorization.startswith("Bearer "):
@@ -53,7 +78,12 @@ def require_api_key(authorization: str = Header(...)):
 def _run_transcription(job_id: str, file_path: str, filename_stem: str, language: str | None, cancel_event: threading.Event):
     path = Path(file_path)
     size_mb = path.stat().st_size / 1024 / 1024 if path.exists() else 0
-    logger.info(f"[{job_id}] ▶ Iniciando transcripción — archivo={filename_stem!r} size={size_mb:.1f}MB language={language or f'default({settings.default_language})'}")
+    pos = get_queue_position(job_id)
+    logger.info(f"[{job_id}] ▶ En cola posición {pos} — archivo={filename_stem!r} size={size_mb:.1f}MB")
+
+    with _transcription_semaphore:
+        _dequeue(job_id)
+        logger.info(f"[{job_id}] 🟢 Iniciando transcripción — language={language or f'default({settings.default_language})'}")
     try:
         set_processing(job_id)
         logger.info(f"[{job_id}] ⚙ Cargando modelo Whisper ({settings.model_size})...")
@@ -141,6 +171,7 @@ async def transcribe_file(
 
     cancel_event = threading.Event()
     _cancel_flags[job_id] = cancel_event
+    _enqueue(job_id)
 
     thread = threading.Thread(
         target=_run_transcription,
@@ -177,6 +208,11 @@ def get_status(job_id: str, _: None = Depends(require_api_key)):
     elif job["status"] == "processing":
         if job.get("partial_text"):
             response["partial_text"] = job["partial_text"]
+    elif job["status"] == "pending":
+        pos = get_queue_position(job_id)
+        if pos > 0:
+            response["queue_position"] = pos
+            response["queue_message"] = f"En cola — {pos} trabajo{'s' if pos > 1 else ''} antes que el tuyo"
     elif job["status"] == "error":
         response["error"] = job["error"]
 
