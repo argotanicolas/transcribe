@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import aiofiles
 
-from .config import settings
+from .config import settings, MAX_FILE_SIZE_MB
 from .transcriber import transcribe_stream, segments_to_srt, ALL_EXTENSIONS, get_model_size, set_model_size
 from .database import (
     init_db, reset_stuck_jobs, create_job,
@@ -143,7 +143,7 @@ async def transcribe_file(
         logger.warning(f"Formato rechazado: {ext} — archivo={file.filename!r}")
         raise HTTPException(status_code=400, detail=f"Unsupported format: {ext}. Allowed: {', '.join(ALL_EXTENSIONS)}")
 
-    max_bytes = settings.max_file_size_mb * 1024 * 1024
+    max_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
     job_id = str(uuid.uuid4())
     file_path = UPLOAD_DIR / f"{job_id}{ext}"
     filename_stem = Path(file.filename or "audio").stem
@@ -156,8 +156,8 @@ async def transcribe_file(
             while chunk := await file.read(1024 * 1024):
                 total += len(chunk)
                 if total > max_bytes:
-                    logger.warning(f"[{job_id}] Archivo demasiado grande: {total / 1024 / 1024:.1f}MB > {settings.max_file_size_mb}MB")
-                    raise HTTPException(status_code=413, detail=f"File exceeds {settings.max_file_size_mb}MB limit")
+                    logger.warning(f"[{job_id}] Archivo demasiado grande: {total / 1024 / 1024:.1f}MB > {MAX_FILE_SIZE_MB}MB")
+                    raise HTTPException(status_code=413, detail=f"File exceeds {MAX_FILE_SIZE_MB}MB limit")
                 await out.write(chunk)
     except HTTPException:
         if file_path.exists():

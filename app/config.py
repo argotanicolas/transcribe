@@ -8,8 +8,9 @@ class Settings(BaseSettings):
     cpu_threads: int = 4       # ARM Ampere A1 tiene 4 OCPUs — usarlos todos
     num_workers: int = 2       # workers paralelos del modelo
     default_language: str = "es"  # idioma por defecto; pasar "auto" en la request para forzar detección
-    max_file_size_mb: int = 1024
     temp_dir: str = "/tmp/transcribe"
+
+MAX_FILE_SIZE_MB = 1024  # hardcoded — not overridable via env
 
     model_config = {"env_file": ".env", "protected_namespaces": ()}
 
